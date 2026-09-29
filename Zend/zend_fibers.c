@@ -202,6 +202,18 @@ static size_t zend_fiber_get_page_size(void)
 	return page_size;
 }
 
+/* Freed stacks kept for the next fibers of the request, as glibc keeps thread stacks: creating a
+ * fiber then costs no mmap(), madvise(), prctl() and mprotect(), and no page faults on a fresh
+ * stack, and ending one no munmap(). Not with shadow stacks, whose restore token is used up, nor
+ * under ASan. */
+#if !defined(ZEND_WIN32) && !defined(__SANITIZE_ADDRESS__) && (defined(ZEND_FIBER_UCONTEXT) || !BOOST_CONTEXT_SHADOW_STACK)
+# define ZEND_FIBER_STACK_CACHE_SIZE 16
+ZEND_TLS zend_fiber_stack *zend_fiber_stack_cache[ZEND_FIBER_STACK_CACHE_SIZE];
+ZEND_TLS uint32_t zend_fiber_stack_cached = 0;
+#endif
+
+static void zend_fiber_stack_unmap(zend_fiber_stack *stack);
+
 static zend_fiber_stack *zend_fiber_stack_allocate(size_t size)
 {
 	void *pointer;
@@ -220,6 +232,20 @@ static zend_fiber_stack *zend_fiber_stack_allocate(size_t size)
 
 	const size_t stack_size = (size + page_size - 1) / page_size * page_size;
 	const size_t alloc_size = stack_size + ZEND_FIBER_GUARD_PAGES * page_size;
+
+#ifdef ZEND_FIBER_STACK_CACHE_SIZE
+	for (uint32_t i = zend_fiber_stack_cached; i-- > 0;) {
+		zend_fiber_stack *cached = zend_fiber_stack_cache[i];
+		if (cached->size == stack_size) {
+			zend_fiber_stack_cache[i] = zend_fiber_stack_cache[--zend_fiber_stack_cached];
+# ifdef VALGRIND_STACK_REGISTER
+			uintptr_t base = (uintptr_t) cached->pointer;
+			cached->valgrind_stack_id = VALGRIND_STACK_REGISTER(base, base + cached->size);
+# endif
+			return cached;
+		}
+	}
+#endif
 
 #ifdef ZEND_WIN32
 	pointer = VirtualAlloc(0, alloc_size, MEM_COMMIT, PAGE_READWRITE);
@@ -309,6 +335,17 @@ static void zend_fiber_stack_free(zend_fiber_stack *stack)
 #ifdef VALGRIND_STACK_DEREGISTER
 	VALGRIND_STACK_DEREGISTER(stack->valgrind_stack_id);
 #endif
+#ifdef ZEND_FIBER_STACK_CACHE_SIZE
+	if (zend_fiber_stack_cached < ZEND_FIBER_STACK_CACHE_SIZE) {
+		zend_fiber_stack_cache[zend_fiber_stack_cached++] = stack;
+		return;
+	}
+#endif
+	zend_fiber_stack_unmap(stack);
+}
+
+static void zend_fiber_stack_unmap(zend_fiber_stack *stack)
+{
 
 	const size_t page_size = zend_fiber_get_page_size();
 
@@ -1146,6 +1183,11 @@ void zend_fiber_init(void)
 
 void zend_fiber_shutdown(void)
 {
+#ifdef ZEND_FIBER_STACK_CACHE_SIZE
+	while (zend_fiber_stack_cached > 0) {
+		zend_fiber_stack_unmap(zend_fiber_stack_cache[--zend_fiber_stack_cached]);
+	}
+#endif
 #if defined(__SANITIZE_ADDRESS__) || defined(ZEND_FIBER_UCONTEXT)
 	efree(EG(main_fiber_context)->stack);
 #endif
